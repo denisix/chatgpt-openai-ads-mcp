@@ -2,14 +2,26 @@ import { z } from "zod";
 import type { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
 import { adsRequest } from "../lib/ads-client.js";
 import { validateExternalUrl } from "../lib/ssrf-guard.js";
+import { acct, idem, out } from "../lib/validators.js";
+
+/** Pull an entity id out of varied API response shapes ({id}, {data:{id}}, {kind:{id}}). */
+function extractId(res: Record<string, unknown>): string | undefined {
+  if (typeof res.id === "string") return res.id;
+  const data = res.data;
+  if (data && typeof data === "object" && "id" in data && typeof data.id === "string") return data.id;
+  for (const v of Object.values(res)) {
+    if (v && typeof v === "object" && "id" in v && typeof v.id === "string") return v.id;
+  }
+  return undefined;
+}
 
 export function registerWorkflowTools(server: McpServer) {
   server.tool(
     "create_campaign_hierarchy",
-    "Composite workflow: create a full campaign -> ad group -> ad chain in one call. Useful for quick end-to-end creation. Returns all three IDs. If any step fails, earlier objects remain — use update/archive tools to clean up. Prefer atomic tools (create_campaign, create_ad_group, create_ad) for fine-grained control.",
+    "Composite: create campaign → ad group → ad in one call; returns all three IDs. On partial failure earlier objects remain — clean up with update/archive. Prefer atomic create_* tools for fine-grained control.",
     {
-      ad_account_id: z.string().optional(),
-      idempotency_key: z.string().min(1).max(255).optional().describe("Base key for idempotency; suffixed with -campaign/-adgroup/-ad if provided."),
+      ad_account_id: acct,
+      idempotency_key: idem.describe("Base key; suffixed -campaign/-adgroup/-ad when provided."),
       campaign: z
         .object({
           name: z.string().min(3).max(1000).regex(/.*\S.*/),
@@ -28,8 +40,10 @@ export function registerWorkflowTools(server: McpServer) {
           billing_event_type: z.enum(["impression", "click"]).optional(),
           targeting: z.record(z.unknown()).optional(),
           conversion_event_setting_ids: z.array(z.string()).optional(),
+          business_agent_id: z.string().optional(),
+          landing_page_configuration: z.object({ query_string_template: z.string().optional() }).optional(),
         })
-        .describe("Campaign payload (same as create_campaign without ad_account_id)."),
+        .describe("Campaign payload (same as create_campaign)."),
       ad_group: z
         .object({
           name: z.string().min(3).max(1000).regex(/.*\S.*/),
@@ -40,7 +54,11 @@ export function registerWorkflowTools(server: McpServer) {
             billing_event_type: z.enum(["impression", "click"]),
             strategy: z.string().optional(),
             max_bid_micros: z.number().int().min(1).max(30400000000000).optional(),
+            custom_audience_bid_multipliers: z
+              .array(z.object({ custom_audience_id: z.string(), bid_multiplier_micros: z.number().int().min(100000).max(10000000) }))
+              .optional(),
           }),
+          landing_page_configuration: z.object({ query_string_template: z.string().optional() }).optional(),
           product_set: z
             .object({
               product_feed_id: z.string(),
@@ -64,93 +82,60 @@ export function registerWorkflowTools(server: McpServer) {
             file_id: z.string().optional(),
             image_crop: z.record(z.unknown()).optional(),
           }),
+          landing_page_configuration: z.object({ query_string_template: z.string().optional() }).optional(),
         })
         .describe("Ad payload (ad_group_id auto-injected)."),
     },
     async ({ ad_account_id, idempotency_key, campaign, ad_group, ad }) => {
       const baseKey = idempotency_key?.trim();
-      if (ad.creative?.target_url) {
-        validateExternalUrl(ad.creative.target_url, { requireHttps: true, paramName: "ad.creative.target_url" });
-      }
+      if (ad.creative?.target_url) validateExternalUrl(ad.creative.target_url, { requireHttps: true, paramName: "ad.creative.target_url" });
 
-      // Step 1: campaign
-      const campRes = (await adsRequest({
-        method: "POST",
-        path: "/campaigns",
-        body: campaign,
-        adAccountId: ad_account_id,
-        idempotencyKey: baseKey ? `${baseKey}-campaign` : undefined,
-      })) as Record<string, unknown>;
-
-      const campaignId = extractId(campRes);
-      if (!campaignId) throw new Error(`Campaign created but no ID found in response: ${JSON.stringify(campRes).slice(0, 800)}`);
-
-      // Step 2: ad group
-      const adGroupBody = { ...ad_group, campaign_id: campaignId };
-      const adGroupRes = (await adsRequest({
-        method: "POST",
-        path: "/ad_groups",
-        body: adGroupBody,
-        adAccountId: ad_account_id,
-        idempotencyKey: baseKey ? `${baseKey}-adgroup` : undefined,
-      })) as Record<string, unknown>;
-
-      const adGroupId = extractId(adGroupRes);
-      if (!adGroupId) throw new Error(`Ad group created but no ID found: ${JSON.stringify(adGroupRes).slice(0, 800)}`);
-
-      // Step 3: ad
-      const adBody: Record<string, unknown> = { ...ad, ad_group_id: adGroupId };
-      const adRes = (await adsRequest({
-        method: "POST",
-        path: "/ads",
-        body: adBody,
-        adAccountId: ad_account_id,
-        idempotencyKey: baseKey ? `${baseKey}-ad` : undefined,
-      })) as Record<string, unknown>;
-
-      const adId = extractId(adRes);
-
-      const summary = {
-        campaign: campRes,
-        ad_group: adGroupRes,
-        ad: adRes,
-        ids: { campaign_id: campaignId, ad_group_id: adGroupId, ad_id: adId },
-        next_steps: [
-          `Campaign ${campaignId} ready — use get_campaign or activate_campaign.`,
-          `Ad group ${adGroupId} ready — use get_ad_group.`,
-          `Ad ${adId} ready — check review_status via get_ad, create preview via create_ad_preview.`,
-        ],
+      const step = async (path: string, body: Record<string, unknown>, suffix: string, label: string) => {
+        const res = (await adsRequest({
+          method: "POST",
+          path,
+          body,
+          adAccountId: ad_account_id,
+          idempotencyKey: baseKey ? `${baseKey}${suffix}` : undefined,
+        })) as Record<string, unknown>;
+        const id = extractId(res);
+        if (!id) throw new Error(`${label} created but no ID found in response: ${JSON.stringify(res).slice(0, 800)}`);
+        return { res, id };
       };
-      return { content: [{ type: "text", text: JSON.stringify(summary, null, 2) }] };
+
+      const camp = await step("/campaigns", campaign, "-campaign", "Campaign");
+      const group = await step("/ad_groups", { ...ad_group, campaign_id: camp.id }, "-adgroup", "Ad group");
+      const created = await step("/ads", { ...ad, ad_group_id: group.id }, "-ad", "Ad");
+
+      return out({
+        campaign: camp.res,
+        ad_group: group.res,
+        ad: created.res,
+        ids: { campaign_id: camp.id, ad_group_id: group.id, ad_id: created.id },
+        next_steps: [
+          `Campaign ${camp.id} — get_campaign / activate_campaign.`,
+          `Ad group ${group.id} — get_ad_group.`,
+          `Ad ${created.id} — check review_status via get_ad, preview via create_ad_preview.`,
+        ],
+      });
     }
   );
 
   server.tool(
     "poll_audience_operation",
-    "Helper to poll a custom audience mutation until terminal. Calls get_audience_operation once and returns current state. Call repeatedly with backoff (processing -> succeeded/failed). Does NOT loop internally — agent controls retry timing to respect rate limits.",
+    "One-shot poll of an audience mutation (processing → succeeded/failed). Call repeatedly with backoff; no internal loop by design.",
     {
-      ad_account_id: z.string().optional(),
+      ad_account_id: acct,
       custom_audience_id: z.string().min(1).describe("Custom audience ID."),
       operation_id: z.string().min(1).max(128).describe("Operation ID from add/remove/replace/merge."),
     },
-    async ({ ad_account_id, custom_audience_id, operation_id }) => {
-      const data = await adsRequest({
-        method: "GET",
-        path: `/custom_audiences/${encodeURIComponent(custom_audience_id)}/operations/${encodeURIComponent(operation_id)}`,
-        adAccountId: ad_account_id,
-      });
-      return { content: [{ type: "text", text: JSON.stringify(data, null, 2) }] };
-    }
+    async ({ ad_account_id, custom_audience_id, operation_id }) =>
+      out(
+        await adsRequest({
+          method: "GET",
+          path: `/custom_audiences/${encodeURIComponent(custom_audience_id)}/operations/${encodeURIComponent(operation_id)}`,
+          adAccountId: ad_account_id,
+        })
+      )
   );
-}
-
-function extractId(res: Record<string, unknown>): string | undefined {
-  // API returns varied shapes: {id}, {data:{id}}, {campaign:{id}}, or top-level with object field
-  if (typeof res.id === "string") return res.id;
-  if (res.data && typeof (res.data as Record<string, unknown>).id === "string") return (res.data as Record<string, unknown>).id as string;
-  for (const v of Object.values(res)) {
-    if (v && typeof v === "object" && typeof (v as Record<string, unknown>).id === "string") return (v as Record<string, unknown>).id as string;
-  }
-  // Some list-like wrappers: try first element
-  return undefined;
 }

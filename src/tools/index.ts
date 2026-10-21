@@ -13,6 +13,9 @@ import { registerConversionTools } from "./conversions.js";
 import { registerProductFeedTools } from "./product-feeds.js";
 import { registerGeoPartnerTools } from "./geo-partner.js";
 import { registerWorkflowTools } from "./workflows.js";
+import { registerAuditLogTools } from "./audit-logs.js";
+import { registerSandboxTools } from "./sandbox.js";
+import { registerBulkTools } from "./bulk.js";
 
 export function registerAllTools(server: McpServer): void {
   registerAdAccountTools(server);
@@ -29,4 +32,7 @@ export function registerAllTools(server: McpServer): void {
   registerProductFeedTools(server);
   registerGeoPartnerTools(server);
   registerWorkflowTools(server);
+  registerAuditLogTools(server);
+  registerSandboxTools(server);
+  registerBulkTools(server);
 }

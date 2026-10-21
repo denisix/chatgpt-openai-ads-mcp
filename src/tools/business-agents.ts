@@ -1,152 +1,119 @@
 import { z } from "zod";
 import type { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
 import { adsRequest } from "../lib/ads-client.js";
+import { validateExternalUrl } from "../lib/ssrf-guard.js";
+import { acct, out } from "../lib/validators.js";
+
+const privacyUrl = z.string().url().optional().describe("Privacy policy https URL.");
+
+function assertPolicyUrlSafe(url: unknown): void {
+  if (typeof url === "string" && url) validateExternalUrl(url, { requireHttps: true, paramName: "privacy_policy_url" });
+}
 
 export function registerBusinessAgentTools(server: McpServer) {
   server.tool(
     "list_business_agent_tools",
-    "List eligible Business Agent tools installed for the authenticated API project. Use to discover connectors/tools available for business agent creation.",
+    "Business Agent tools/connectors installed for this API project — discover IDs for create_business_agent.",
     {},
-    async () => {
-      const data = await adsRequest({ method: "GET", path: "/business_agent_tools" });
-      return { content: [{ type: "text", text: JSON.stringify(data, null, 2) }] };
-    }
+    async () => out(await adsRequest({ method: "GET", path: "/business_agent_tools" }))
   );
 
   server.tool(
     "list_business_agents",
-    "List Business Agents for the ad account. Each has id, name, status draft/published, etc.",
-    {
-      ad_account_id: z.string().optional(),
-    },
-    async ({ ad_account_id }) => {
-      const data = await adsRequest({ method: "GET", path: "/business_agents", adAccountId: ad_account_id });
-      return { content: [{ type: "text", text: JSON.stringify(data, null, 2) }] };
-    }
+    "List Business Agents (id, name, draft/published status).",
+    { ad_account_id: acct },
+    async ({ ad_account_id }) => out(await adsRequest({ method: "GET", path: "/business_agents", adAccountId: ad_account_id }))
   );
 
   server.tool(
     "create_business_agent",
-    "Create a draft Business Agent. Requires name 1–50 + instructions 1–4000. Optionally attach product feeds, connectors, lead form. Publish separately via publish_business_agent.",
+    "Create a draft Business Agent (name 1–50, instructions 1–4000). Publish separately via publish_business_agent.",
     {
-      ad_account_id: z.string().optional(),
+      ad_account_id: acct,
       name: z.string().min(1).max(50).describe("Agent name 1–50 chars."),
-      instructions: z.string().min(1).max(4000).describe("Agent instructions 1–4000 chars."),
-      description: z.string().min(1).max(300).optional().describe("Description 1–300 chars."),
-      privacy_policy_url: z.string().url().optional().describe("Privacy policy https URL."),
-      conversation_starters: z.array(z.string().max(300)).max(12).optional().describe("Up to 12 starters, each max 300."),
-      product_feed_ids: z.array(z.string()).max(50).optional().describe("Up to 50 product feed IDs."),
-      connector_ids: z.array(z.string()).max(50).optional().describe("Up to 50 connector IDs."),
+      instructions: z.string().min(1).max(4000).describe("Instructions 1–4000 chars."),
+      description: z.string().min(1).max(300).optional(),
+      privacy_policy_url: privacyUrl,
+      conversation_starters: z.array(z.string().max(300)).max(12).optional().describe("Up to 12 starters, <=300 chars each."),
+      product_feed_ids: z.array(z.string()).max(50).optional(),
+      connector_ids: z.array(z.string()).max(50).optional(),
       tools: z.array(z.record(z.unknown())).max(50).optional().describe("Up to 50 tool definitions."),
-      lead_form: z
-        .object({
-          lead_form_id: z.string().min(1),
-          lead_form_revision_id: z.string().optional(),
-        })
-        .optional()
-        .describe("Lead form linkage."),
+      lead_form: z.object({ lead_form_id: z.string().min(1), lead_form_revision_id: z.string().optional() }).optional().describe("Lead form linkage."),
     },
-    async ({ ad_account_id, ...body }) => {
-      const clean: Record<string, unknown> = {};
-      for (const [k, v] of Object.entries(body)) if (v !== undefined) clean[k] = v;
-      if (clean.privacy_policy_url) {
-        const { validateExternalUrl } = await import("../lib/ssrf-guard.js");
-        validateExternalUrl(clean.privacy_policy_url as string, { requireHttps: true, paramName: "privacy_policy_url" });
-      }
-      const data = await adsRequest({ method: "POST", path: "/business_agents", body: clean, adAccountId: ad_account_id });
-      return { content: [{ type: "text", text: JSON.stringify(data, null, 2) }] };
+    async ({ ad_account_id, ...rest }) => {
+      assertPolicyUrlSafe(rest.privacy_policy_url);
+      return out(await adsRequest({ method: "POST", path: "/business_agents", body: rest, adAccountId: ad_account_id }));
     }
   );
 
   server.tool(
     "get_business_agent",
-    "Get a Business Agent by ID.",
+    "One Business Agent by ID.",
     {
-      ad_account_id: z.string().optional(),
+      ad_account_id: acct,
       business_agent_id: z.string().min(1).describe("Business agent ID."),
     },
-    async ({ ad_account_id, business_agent_id }) => {
-      const data = await adsRequest({
-        method: "GET",
-        path: `/business_agents/${encodeURIComponent(business_agent_id)}`,
-        adAccountId: ad_account_id,
-      });
-      return { content: [{ type: "text", text: JSON.stringify(data, null, 2) }] };
-    }
+    async ({ ad_account_id, business_agent_id }) =>
+      out(await adsRequest({ method: "GET", path: `/business_agents/${encodeURIComponent(business_agent_id)}`, adAccountId: ad_account_id }))
   );
 
   server.tool(
     "update_business_agent",
-    "Replace a Business Agent's name and config and save as draft. Omitted optional fields reset to defaults (except lead_form preserved if omitted; send null to unlink). Requires full desired state.",
+    "Replace a Business Agent's config and save as draft. Requires full desired state; omitted optional fields reset (lead_form preserved unless null).",
     {
-      ad_account_id: z.string().optional(),
+      ad_account_id: acct,
       business_agent_id: z.string().min(1).describe("Business agent ID."),
-      name: z.string().min(1).max(50).describe("Agent name 1–50 chars (required for update)."),
+      name: z.string().min(1).max(50).describe("Agent name 1–50 chars."),
       instructions: z.string().min(1).max(4000).describe("Instructions 1–4000 chars."),
       description: z.string().min(1).max(300).nullable().optional(),
-      privacy_policy_url: z.string().url().nullable().optional(),
+      privacy_policy_url: privacyUrl.nullable().optional(),
       conversation_starters: z.array(z.string().max(300)).max(12).nullable().optional(),
       product_feed_ids: z.array(z.string()).max(50).optional(),
       connector_ids: z.array(z.string()).max(50).optional(),
       tools: z.array(z.record(z.unknown())).max(50).optional(),
-      lead_form: z
-        .object({ lead_form_id: z.string().min(1), lead_form_revision_id: z.string().optional() })
-        .nullable()
-        .optional(),
+      lead_form: z.object({ lead_form_id: z.string().min(1), lead_form_revision_id: z.string().optional() }).nullable().optional(),
     },
-    async ({ ad_account_id, business_agent_id, ...body }) => {
-      const clean: Record<string, unknown> = {};
-      for (const [k, v] of Object.entries(body)) if (v !== undefined) clean[k] = v;
-      if (clean.privacy_policy_url && typeof clean.privacy_policy_url === "string") {
-        const { validateExternalUrl } = await import("../lib/ssrf-guard.js");
-        validateExternalUrl(clean.privacy_policy_url, { requireHttps: true, paramName: "privacy_policy_url" });
-      }
-      const data = await adsRequest({
-        method: "POST",
-        path: `/business_agents/${encodeURIComponent(business_agent_id)}`,
-        body: clean,
-        adAccountId: ad_account_id,
-      });
-      return { content: [{ type: "text", text: JSON.stringify(data, null, 2) }] };
+    async ({ ad_account_id, business_agent_id, ...rest }) => {
+      assertPolicyUrlSafe(rest.privacy_policy_url);
+      return out(
+        await adsRequest({
+          method: "POST",
+          path: `/business_agents/${encodeURIComponent(business_agent_id)}`,
+          body: rest,
+          adAccountId: ad_account_id,
+        })
+      );
     }
   );
 
   server.tool(
     "preview_business_agent",
-    "Preview a response from a Business Agent. Useful for QA before publishing. Provide a test message.",
+    "Preview a Business Agent response for QA before publishing.",
     {
-      ad_account_id: z.string().optional(),
+      ad_account_id: acct,
       business_agent_id: z.string().min(1).describe("Business agent ID."),
-      message: z.string().min(1).describe("Test user message to preview."),
+      message: z.string().min(1).describe("Test user message."),
       conversation_id: z.string().optional().describe("Optional conversation ID for context."),
     },
-    async ({ ad_account_id, business_agent_id, message, conversation_id }) => {
-      const body: Record<string, unknown> = { message };
-      if (conversation_id) body.conversation_id = conversation_id;
-      const data = await adsRequest({
-        method: "POST",
-        path: `/business_agents/${encodeURIComponent(business_agent_id)}/preview`,
-        body,
-        adAccountId: ad_account_id,
-      });
-      return { content: [{ type: "text", text: JSON.stringify(data, null, 2) }] };
-    }
+    async ({ ad_account_id, business_agent_id, message, conversation_id }) =>
+      out(
+        await adsRequest({
+          method: "POST",
+          path: `/business_agents/${encodeURIComponent(business_agent_id)}/preview`,
+          body: conversation_id ? { message, conversation_id } : { message },
+          adAccountId: ad_account_id,
+        })
+      )
   );
 
   server.tool(
     "publish_business_agent",
-    "Publish a Business Agent draft to make it live. Ensure preview looks good first.",
+    "Publish a Business Agent draft to make it live (preview first).",
     {
-      ad_account_id: z.string().optional(),
+      ad_account_id: acct,
       business_agent_id: z.string().min(1).describe("Business agent ID."),
     },
-    async ({ ad_account_id, business_agent_id }) => {
-      const data = await adsRequest({
-        method: "POST",
-        path: `/business_agents/${encodeURIComponent(business_agent_id)}/publish`,
-        adAccountId: ad_account_id,
-      });
-      return { content: [{ type: "text", text: JSON.stringify(data, null, 2) }] };
-    }
+    async ({ ad_account_id, business_agent_id }) =>
+      out(await adsRequest({ method: "POST", path: `/business_agents/${encodeURIComponent(business_agent_id)}/publish`, adAccountId: ad_account_id }))
   );
 }

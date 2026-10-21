@@ -1,25 +1,53 @@
 /**
- * SSRF guard for any user-supplied URL that this MCP will fetch.
- * Blocks private networks, non-https, disallowed schemes, and overly long URLs.
- * No DNS lookup here — string-level block is deterministic; upstream fetch still enforces timeouts.
+ * String-level SSRF guard for user-supplied URLs (creatives, feeds, webhooks).
+ * Blocks private/loopback/link-local/CGNAT hosts (IPv4 + IPv6, including
+ * mapped forms), non-http(s) schemes, embedded credentials, overlong URLs.
+ * Deterministic — no DNS lookups; DNS rebinding is out of scope.
  */
 
 const MAX_URL_LENGTH = 2048;
-const BLOCKED_SCHEMES = new Set(["file:", "javascript:", "data:", "ftp:", "gopher:"]);
+const BLOCKED_SCHEMES: Record<string, true> = {
+  "file:": true,
+  "javascript:": true,
+  "data:": true,
+  "ftp:": true,
+  "gopher:": true,
+};
 
+// Tested against the bracket-stripped, lowercased host (WHATWG URL keeps
+// brackets on IPv6 literals, e.g. "[::1]").
 const PRIVATE_HOST_PATTERNS: RegExp[] = [
-  /^localhost$/i,
-  /^127\.\d+\.\d+\.\d+$/i,
-  /^10\.\d+\.\d+\.\d+$/i,
-  /^192\.168\.\d+\.\d+$/i,
-  /^172\.(1[6-9]|2\d|3[0-1])\.\d+\.\d+$/i,
-  /^169\.254\.\d+\.\d+$/i, // link-local incl. cloud metadata
-  /^0\.0\.0\.0$/i,
-  /^::1$/i,
-  /^fc00:/i,
-  /^fd00:/i,
-  /^fe80:/i,
+  /^localhost$/,
+  // IPv4 special ranges
+  /^127\.\d+\.\d+\.\d+$/,
+  /^10\.\d+\.\d+\.\d+$/,
+  /^192\.168\.\d+\.\d+$/,
+  /^169\.254\.\d+\.\d+$/, // link-local incl. cloud metadata
+  /^172\.(1[6-9]|2\d|3[01])\.\d+\.\d+$/,
+  /^100\.(6[4-9]|[7-9]\d|1[01]\d|12[0-7])\.\d+\.\d+$/, // CGNAT 100.64/10
+  /^0\.0\.0\.0$/,
+  // IPv6 loopback / ULA / link-local
+  /^::1$/,
+  /^f[cd][0-9a-f]{2}:/,
+  /^fe80:/,
 ];
+/** Host forms to check: bare hostname plus any embedded IPv4 (mapped/NAT64). */
+function hostCandidates(hostname: string): string[] {
+  const bare = hostname.toLowerCase().replace(/^\[(.*)\]$/, "$1");
+  const out = [bare];
+  if (/^::ffff:/.test(bare) || bare.includes("64:ff9b:")) {
+    // ::ffff:0:0/96 (IPv4-mapped) and 64:ff9b::/96 (NAT64): low 32 bits are IPv4.
+    const dotted = bare.match(/(\d+\.\d+\.\d+\.\d+)$/);
+    if (dotted) out.push(dotted[1]);
+    const tail = bare.split(":").filter(Boolean).slice(-2);
+    if (tail.length === 2 && tail.every((h) => /^[0-9a-f]{1,4}$/.test(h))) {
+      const hi = parseInt(tail[0], 16);
+      const lo = parseInt(tail[1], 16);
+      out.push(`${hi >> 8}.${hi & 255}.${lo >> 8}.${lo & 255}`);
+    }
+  }
+  return out;
+}
 
 export function validateExternalUrl(
   raw: string,
@@ -42,34 +70,23 @@ export function validateExternalUrl(
     throw new Error(`${paramName} is not a valid URL: ${raw.slice(0, 80)}`);
   }
 
-  if (BLOCKED_SCHEMES.has(url.protocol)) {
+  if (BLOCKED_SCHEMES[url.protocol]) {
     throw new Error(`${paramName} uses blocked scheme ${url.protocol}.`);
   }
   if (requireHttps && url.protocol !== "https:") {
-    throw new Error(
-      `${paramName} must use https: (got ${url.protocol}). Set requireHttps false only if you explicitly need http.`
-    );
+    throw new Error(`${paramName} must use https: (got ${url.protocol}).`);
   }
-  if (!["https:", "http:"].includes(url.protocol)) {
+  if (url.protocol !== "https:" && url.protocol !== "http:") {
     throw new Error(`${paramName} must be https: or http: (got ${url.protocol}).`);
   }
-
-  const host = url.hostname.trim();
-  for (const re of PRIVATE_HOST_PATTERNS) {
-    if (re.test(host)) {
-      throw new Error(
-        `${paramName} points to a private/internal host (${host}) — blocked to prevent SSRF.`
-      );
-    }
-  }
-  // Block bare private shortnames that resolve internally (heuristic)
-  if (!host.includes(".") && host.toLowerCase() !== "localhost") {
-    // Allow only if it's an explicit allowlist? For now block ambiguous.
-    // But "*.openai.com" etc all contain dots, so this is safe.
-  }
-
   if (url.username || url.password) {
     throw new Error(`${paramName} must not contain embedded credentials.`);
+  }
+
+  for (const host of hostCandidates(url.hostname)) {
+    if (PRIVATE_HOST_PATTERNS.some((re) => re.test(host))) {
+      throw new Error(`${paramName} points to a private/internal host (${url.hostname}) — blocked to prevent SSRF.`);
+    }
   }
 
   return url;

@@ -5,8 +5,8 @@ import { registerAllTools } from "./tools/index.js";
 
 const server = new McpServer(
   {
-    name: "chatgpt-ads-manager-mcp",
-    version: "0.1.0",
+    name: "chatgpt-openai-ads-mcp",
+    version: "0.2.0",
   },
   {
     capabilities: {
@@ -24,10 +24,10 @@ async function main() {
   const transport = new StdioServerTransport();
   await server.connect(transport);
   // Log to stderr only — stdout is MCP protocol
-  console.error("chatgpt-ads-manager-mcp running on stdio");
+  console.error("chatgpt-openai-ads-mcp running on stdio");
 }
 
 main().catch((err) => {
-  console.error("Fatal error starting chatgpt-ads-manager-mcp:", err);
+  console.error("Fatal error starting chatgpt-openai-ads-mcp:", err);
   process.exit(1);
 });

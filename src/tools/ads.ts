@@ -1,64 +1,57 @@
 import { z } from "zod";
 import type { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
 import { adsRequest } from "../lib/ads-client.js";
+import { validateExternalUrl } from "../lib/ssrf-guard.js";
+import { acct, idem, listParams, out, restQuery } from "../lib/validators.js";
+
+function assertCreativeUrlSafe(creative: unknown): void {
+  if (creative && typeof creative === "object" && "target_url" in creative) {
+    const url = creative.target_url;
+    if (typeof url === "string" && url) validateExternalUrl(url, { requireHttps: true, paramName: "creative.target_url" });
+  }
+}
 
 export function registerAdTools(server: McpServer) {
   server.tool(
     "list_ads",
-    "List ads for the ad account, optionally filtered by campaign_id or ad_group_id. Use ad_id for get_ad / insights / preview.",
+    "List ads (optionally by campaign_id/ad_group_id). ad_id chains to get_ad, insights, preview.",
     {
-      ad_account_id: z.string().optional(),
+      ad_account_id: acct,
       campaign_id: z.string().optional().describe("Filter by campaign ID."),
       ad_group_id: z.string().optional().describe("Filter by ad group ID."),
       name: z.string().min(3).max(1000).optional(),
-      limit: z.number().int().min(1).max(500).optional(),
-      after: z.string().optional(),
-      before: z.string().optional(),
-      order: z.enum(["asc", "desc"]).optional(),
+      ...listParams,
       include: z.array(z.string()).optional(),
     },
-    async ({ ad_account_id, campaign_id, ad_group_id, name, limit, after, before, order, include }) => {
-      const query: Record<string, string | string[] | undefined> = {};
-      if (campaign_id) query.campaign_id = campaign_id;
-      if (ad_group_id) query.ad_group_id = ad_group_id;
-      if (name) query.name = name;
-      if (limit) query.limit = String(limit);
-      if (after) query.after = after;
-      if (before) query.before = before;
-      if (order) query.order = order;
-      if (include) query.include = include;
-      const data = await adsRequest({ method: "GET", path: "/ads", query, adAccountId: ad_account_id });
-      return { content: [{ type: "text", text: JSON.stringify(data, null, 2) }] };
-    }
+    async ({ ad_account_id, ...rest }) =>
+      out(await adsRequest({ method: "GET", path: "/ads", query: restQuery(rest), adAccountId: ad_account_id }))
   );
 
   server.tool(
     "get_ad",
-    "Get a single ad by ID. Check review_status to monitor approval (typically minutes).",
+    "One ad by ID. Check review_status to monitor approval (typically minutes).",
     {
-      ad_account_id: z.string().optional(),
+      ad_account_id: acct,
       ad_id: z.string().min(1).describe("Ad ID."),
       include: z.array(z.string()).optional(),
     },
-    async ({ ad_account_id, ad_id, include }) => {
-      const query: Record<string, string | string[] | undefined> = {};
-      if (include) query.include = include;
-      const data = await adsRequest({
-        method: "GET",
-        path: `/ads/${encodeURIComponent(ad_id)}`,
-        query,
-        adAccountId: ad_account_id,
-      });
-      return { content: [{ type: "text", text: JSON.stringify(data, null, 2) }] };
-    }
+    async ({ ad_account_id, ad_id, include }) =>
+      out(
+        await adsRequest({
+          method: "GET",
+          path: `/ads/${encodeURIComponent(ad_id)}`,
+          query: restQuery({ include }),
+          adAccountId: ad_account_id,
+        })
+      )
   );
 
   server.tool(
     "create_ad",
-    "Create an ad for an ad group. Requires creative (type/title/body etc.). For chat_card, provide file_id from upload_image. For product_ad_template, use {{product.*}} tokens and omit file_id. Returns ad_id.",
+    "Create an ad under an ad group; returns ad_id. chat_card needs file_id from upload_image + target_url; product_ad_template uses {{product.*}} tokens and no file_id.",
     {
-      ad_account_id: z.string().optional(),
-      idempotency_key: z.string().min(1).max(255).optional(),
+      ad_account_id: acct,
+      idempotency_key: idem,
       ad_group_id: z.string().min(1).describe("Parent ad group ID."),
       name: z.string().min(3).max(1000).regex(/.*\S.*/).optional().describe("Ad name."),
       status: z.enum(["active", "paused"]).optional(),
@@ -66,133 +59,93 @@ export function registerAdTools(server: McpServer) {
         .object({
           type: z.enum(["chat_card", "product_ad_template"]).describe("Creative type."),
           title: z.string().min(3).max(50).regex(/.*\S.*/).describe("Title 3–50 chars."),
-          body: z.string().max(1000).optional().describe("Body up to ~100 chars recommended (max 1000 in schema)."),
+          body: z.string().max(100).describe("Body, max 100 chars."),
           price: z.string().max(100).optional().describe("Price string for product template."),
-          target_url: z.string().max(2048).optional().describe("Destination URL (https). Max 2048."),
-          file_id: z.string().optional().describe("File ID from upload_image (required for chat_card)."),
+          target_url: z.string().max(2048).optional().describe("https destination URL (required for chat_card; feed-provided for product_ad_template)."),
+          file_id: z.string().optional().describe("file_id from upload_image (required for chat_card)."),
           image_crop: z.record(z.unknown()).optional().describe("Normalized square crop for chat_card."),
         })
         .describe("Creative object."),
       description: z.string().optional(),
+      landing_page_configuration: z
+        .object({ query_string_template: z.string().optional() })
+        .optional()
+        .describe("Tracking template, e.g. utm_source=openai&utm_campaign={campaign_id}&utm_content={ad_id}&click_id={oppref}. Ad level wins on key conflicts."),
     },
-    async ({ ad_account_id, idempotency_key, ...body }) => {
-      const clean: Record<string, unknown> = {};
-      for (const [k, v] of Object.entries(body)) if (v !== undefined) clean[k] = v;
-      // Validate target_url if present (SSRF guard, https only)
-      if (clean.creative && typeof clean.creative === "object") {
-        const cr = clean.creative as Record<string, unknown>;
-        if (typeof cr.target_url === "string" && cr.target_url) {
-          const { validateExternalUrl } = await import("../lib/ssrf-guard.js");
-          validateExternalUrl(cr.target_url, { requireHttps: true, paramName: "creative.target_url" });
-        }
-      }
-      const data = await adsRequest({
-        method: "POST",
-        path: "/ads",
-        body: clean,
-        adAccountId: ad_account_id,
-        idempotencyKey: idempotency_key?.trim() || undefined,
-      });
-      return { content: [{ type: "text", text: JSON.stringify(data, null, 2) }] };
+    async ({ ad_account_id, idempotency_key, ...rest }) => {
+      assertCreativeUrlSafe(rest.creative);
+      return out(
+        await adsRequest({
+          method: "POST",
+          path: "/ads",
+          body: rest,
+          adAccountId: ad_account_id,
+          idempotencyKey: idempotency_key?.trim() || undefined,
+        })
+      );
     }
   );
 
   server.tool(
     "update_ad",
-    "Update an ad by ID. Only provided fields are updated.",
+    "Update an ad by ID (only provided fields). Send the complete creative — changing it triggers re-review.",
     {
-      ad_account_id: z.string().optional(),
+      ad_account_id: acct,
       ad_id: z.string().min(1).describe("Ad ID."),
       name: z.string().min(3).max(1000).regex(/.*\S.*/).optional(),
       status: z.enum(["active", "paused", "archived"]).optional(),
-      creative: z.record(z.unknown()).optional(),
+      creative: z.record(z.unknown()).optional().describe("Full creative object."),
       description: z.string().nullable().optional(),
+      landing_page_configuration: z.object({ query_string_template: z.string().nullable().optional() }).optional().describe("Tracking template; ad level wins on key conflicts."),
     },
-    async ({ ad_account_id, ad_id, ...body }) => {
-      const clean: Record<string, unknown> = {};
-      for (const [k, v] of Object.entries(body)) if (v !== undefined) clean[k] = v;
-      if (clean.creative && typeof clean.creative === "object") {
-        const cr = clean.creative as Record<string, unknown>;
-        if (typeof cr.target_url === "string" && cr.target_url) {
-          const { validateExternalUrl } = await import("../lib/ssrf-guard.js");
-          validateExternalUrl(cr.target_url as string, { requireHttps: true, paramName: "creative.target_url" });
-        }
-      }
-      const data = await adsRequest({
-        method: "POST",
-        path: `/ads/${encodeURIComponent(ad_id)}`,
-        body: clean,
-        adAccountId: ad_account_id,
-      });
-      return { content: [{ type: "text", text: JSON.stringify(data, null, 2) }] };
+    async ({ ad_account_id, ad_id, ...rest }) => {
+      assertCreativeUrlSafe(rest.creative);
+      return out(
+        await adsRequest({
+          method: "POST",
+          path: `/ads/${encodeURIComponent(ad_id)}`,
+          body: rest,
+          adAccountId: ad_account_id,
+        })
+      );
     }
   );
 
   server.tool(
     "create_ad_preview",
-    "Create a temporary iframe preview for an existing ad. Returns preview URL/html for QA before activating.",
+    "Temporary iframe preview of an existing ad (QA before activating).",
     {
-      ad_account_id: z.string().optional(),
+      ad_account_id: acct,
       ad_id: z.string().min(1).describe("Ad ID."),
     },
-    async ({ ad_account_id, ad_id }) => {
-      const data = await adsRequest({
-        method: "POST",
-        path: `/ads/${encodeURIComponent(ad_id)}/preview`,
-        adAccountId: ad_account_id,
-      });
-      return { content: [{ type: "text", text: JSON.stringify(data, null, 2) }] };
-    }
+    async ({ ad_account_id, ad_id }) =>
+      out(await adsRequest({ method: "POST", path: `/ads/${encodeURIComponent(ad_id)}/preview`, adAccountId: ad_account_id }))
   );
 
-  server.tool(
-    "activate_ad",
-    "Activate a paused ad. Campaign and ad group must also be active + review approved to serve.",
-    {
-      ad_account_id: z.string().optional(),
-      ad_id: z.string().min(1).describe("Ad ID."),
-    },
-    async ({ ad_account_id, ad_id }) => {
-      const data = await adsRequest({
-        method: "POST",
-        path: `/ads/${encodeURIComponent(ad_id)}/activate`,
-        adAccountId: ad_account_id,
-      });
-      return { content: [{ type: "text", text: JSON.stringify(data, null, 2) }] };
-    }
-  );
+  const lifecycle = (action: string, desc: string) =>
+    server.tool(
+      `${action}_ad`,
+      desc,
+      {
+        ad_account_id: acct,
+        ad_id: z.string().min(1).describe("Ad ID."),
+      },
+      async ({ ad_account_id, ad_id }) =>
+        out(await adsRequest({ method: "POST", path: `/ads/${encodeURIComponent(ad_id)}/${action}`, adAccountId: ad_account_id }))
+    );
+
+  lifecycle("activate", "Activate a paused ad. Campaign + ad group active and review approved required to serve.");
+  lifecycle("pause", "Pause an active ad.");
+  lifecycle("archive", "Archive an ad (terminal).");
 
   server.tool(
-    "pause_ad",
-    "Pause an active ad.",
+    "get_ad_landing_page_crawl",
+    "Landing-page crawl result for an ad (can OpenAI's crawlers reach target_url). Use when review/serving issues mention the destination.",
     {
-      ad_account_id: z.string().optional(),
+      ad_account_id: acct,
       ad_id: z.string().min(1).describe("Ad ID."),
     },
-    async ({ ad_account_id, ad_id }) => {
-      const data = await adsRequest({
-        method: "POST",
-        path: `/ads/${encodeURIComponent(ad_id)}/pause`,
-        adAccountId: ad_account_id,
-      });
-      return { content: [{ type: "text", text: JSON.stringify(data, null, 2) }] };
-    }
-  );
-
-  server.tool(
-    "archive_ad",
-    "Archive an ad (terminal).",
-    {
-      ad_account_id: z.string().optional(),
-      ad_id: z.string().min(1).describe("Ad ID."),
-    },
-    async ({ ad_account_id, ad_id }) => {
-      const data = await adsRequest({
-        method: "POST",
-        path: `/ads/${encodeURIComponent(ad_id)}/archive`,
-        adAccountId: ad_account_id,
-      });
-      return { content: [{ type: "text", text: JSON.stringify(data, null, 2) }] };
-    }
+    async ({ ad_account_id, ad_id }) =>
+      out(await adsRequest({ method: "GET", path: `/ads/${encodeURIComponent(ad_id)}/landing_page_crawl`, adAccountId: ad_account_id }))
   );
 }

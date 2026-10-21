@@ -1,10 +1,10 @@
 {
-  "name": "chatgpt-ads-manager-mcp",
-  "version": "0.1.1",
+  "name": "@denisixnpm/chatgpt-openai-ads-mcp",
+  "version": "0.2.0",
   "description": "MCP server for the ChatGPT Advertiser API — manage campaigns, ad groups, ads, assets, audiences, conversions, and insights from any MCP-capable agent.",
   "type": "module",
   "bin": {
-    "chatgpt-ads-manager-mcp": "dist/index.js"
+    "chatgpt-openai-ads-mcp": "dist/index.js"
   },
   "main": "./dist/index.js",
   "files": [
@@ -21,7 +21,7 @@
     "advertising",
     "campaigns"
   ],
-  "author": "",
+  "author": "denisix",
   "license": "MIT",
   "engines": {
     "node": ">=18.0.0"
@@ -48,11 +48,11 @@
   },
   "repository": {
     "type": "git",
-    "url": "git+https://github.com/niyogi/chatgpt-ads-manager-mcp.git"
+    "url": "git+https://github.com/denisix/chatgpt-openai-ads-mcp.git"
   },
-  "homepage": "https://github.com/niyogi/chatgpt-ads-manager-mcp#readme",
+  "homepage": "https://github.com/denisix/chatgpt-openai-ads-mcp#readme",
   "bugs": {
-    "url": "https://github.com/niyogi/chatgpt-ads-manager-mcp/issues"
+    "url": "https://github.com/denisix/chatgpt-openai-ads-mcp/issues"
   },
   "publishConfig": {
     "access": "public"
