@@ -62,7 +62,7 @@ All configs use env var `OPENAI_ADS_API_KEY` (alias `CHATGPT_ADS_API_KEY`). Mult
 ### Claude Code / Windsurf / Cline / any `mcp.json` client
 
 ```bash
-claude mcp add -e OPENAI_ADS_API_KEY=sk-ads-... chatgpt-openai-ads -- npx -y @denisixnpm/chatgpt-openai-ads-mcp@latest
+claude mcp add chatgpt-openai-ads -e OPENAI_ADS_API_KEY=sk-ads-... -- npx -y @denisixnpm/chatgpt-openai-ads-mcp@latest
 ```
 
 > `@latest` auto-updates on restart; pin with `@0.2.0` for reproducibility. stdio only — wrap with `mcp-remote` if you need HTTP.
